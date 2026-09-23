@@ -129,6 +129,10 @@ RUN pip install flash-attn
 # install numba for latest containers
 RUN pip install numba>=0.57.1
 
+# The LLM steps in paper/analysis (extract_boost_phrases.py, llm_find_sounds_like.py)
+# need an OpenAI client and a response cache.
+RUN pip install diskcache openai
+
 # copy nemo source into a scratch image
 FROM scratch as nemo-src
 COPY . .
