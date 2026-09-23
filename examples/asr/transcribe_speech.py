@@ -210,6 +210,8 @@ class TranscriptionConfig:
     warmup_steps: int = 0  # by default - no warmup
     run_steps: int = 1  # by default - single run
 
+    save_token_ids: bool = False  # Also write each hypothesis' raw token-id sequence into the output JSON
+
 
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
 def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis]]:

@@ -31,6 +31,8 @@ from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.utils import logging
 from nemo.utils.exceptions import NeMoBaseException
 
+SPELLING_SEPARATOR = "_"
+DEFAULT_BOOST_VALUE = 1
 
 @dataclass
 class PhraseItem:
@@ -73,6 +75,8 @@ class BoostingTreeModelConfig:
         5  # The number of alternative transcriptions to generate for each context-biasing phrase
     )
     bpe_alpha: float = 0.3  # The alpha parameter for BPE dropout
+    word_tokens_file: Optional[str] = None  # TSV with observed word→token-id mappings (for suppression)
+    boost_tokens_file: Optional[str] = None  # TSV with alternative tokenizations for boosted words
 
     @staticmethod
     def is_empty(cfg: "BoostingTreeModelConfig") -> bool:
@@ -82,6 +86,19 @@ class BoostingTreeModelConfig:
             and (not cfg.key_phrases_list)
             and (not cfg.key_phrase_items_list)
         )
+
+
+def load_tokens_tsv(path: str) -> dict[str, list[list[int]]]:
+    """Load a word→token-ids TSV into {word: [[id, ...], ...]}."""
+    tokens_map: dict[str, list[list[int]]] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("word\t"):
+                continue
+            word, ids_str = line.split("\t", 1)
+            tokens_map.setdefault(word, []).append([int(x) for x in ids_str.split()])
+    return tokens_map
 
 
 class TBranch(NamedTuple):
@@ -196,6 +213,7 @@ class BoostingTreeStorage:
 
             if tbranch.next_node.is_end and not self.uniform_weights:
                 # we do not penalize transitions from final nodes in case of non-uniform weights
+                backoff_state = self.start_state
                 backoff_weight = 0.0
             else:
                 backoff_weight = tbranch.next_node.fail.node_score - tbranch.next_node.node_score
@@ -572,27 +590,57 @@ class GPUBoostingTreeModel(NGramGPULanguageModel):
                 use_bpe_dropout = False
             spm.set_random_generator_seed(1234)  # fix random seed for reproducibility of BPE dropout
 
+        phrases_to_boost_values = dict()
         for phrase_item in phrase_items_list:
-            phrase = phrase_item.phrase
+            phrase = phrase_item.phrase.strip()
+            if not phrase:
+                continue
+            # Each line is `phrase_value`: a positive value boosts the phrase, a
+            # negative value suppresses it (e.g. a confusable / sounds-like word).
+            # The value is the trailing `_<number>` field; a line with no numeric
+            # suffix falls back to DEFAULT_BOOST_VALUE. Phrases never contain a
+            # `_` themselves (multi-word terms use spaces), so the last `_` is the
+            # value separator.
+            word, separator, value_str = phrase.rpartition(SPELLING_SEPARATOR)
+            if separator:
+                try:
+                    boost_value = float(value_str)
+                except ValueError:
+                    word, boost_value = phrase, DEFAULT_BOOST_VALUE
+            else:
+                word, boost_value = phrase, DEFAULT_BOOST_VALUE
+            if boost_value < -10 or boost_value > 10:
+                raise ValueError(
+                    f"Boost value {boost_value} is not valid. Valid values are -10 to 10 "
+                    "(positive boosts, negative suppresses, 0 to skip)."
+                )
+            phrases_to_boost_values[word] = boost_value
+        for phrase in list(phrases_to_boost_values.keys()):
+            if phrases_to_boost_values[phrase] == 0:
+                phrases_to_boost_values.pop(phrase)
+        word_tokens_map = load_tokens_tsv(cfg.word_tokens_file) if cfg.word_tokens_file else {}
+        boost_tokens_map = load_tokens_tsv(cfg.boost_tokens_file) if cfg.boost_tokens_file else {}
+
+        for phrase in phrases_to_boost_values.keys():
             if use_bpe_dropout:
                 phrases_dict[phrase] = cls.get_alternative_transcripts(cfg, tokenizer, phrase)
             else:
                 if is_aggregate_tokenizer:
-                    phrases_dict[phrase] = tokenizer.text_to_ids(phrase, phrase_item.lang)
+                    phrases_dict[phrase] = [tokenizer.text_to_ids(phrase, phrase_item.lang)]
                 else:
-                    phrases_dict[phrase] = tokenizer.text_to_ids(phrase)
+                    if phrases_to_boost_values[phrase] < 0 and phrase in word_tokens_map:
+                        phrases_dict[phrase] = word_tokens_map[phrase]
+                    elif phrases_to_boost_values[phrase] > 0 and phrase in boost_tokens_map:
+                        phrases_dict[phrase] = boost_tokens_map[phrase]
+                    else:
+                        phrases_dict[phrase] = [tokenizer.text_to_ids(phrase)]
 
         # 3. build pythoncontext graph
         contexts, scores, phrases = [], [], []
-        for phrase in phrases_dict:
-            if use_bpe_dropout:
-                for transcript in phrases_dict[phrase]:
-                    contexts.append(transcript)
-                    scores.append(round(cfg.score_per_phrase / len(phrase), 2))
-                    phrases.append(phrase)
-            else:
-                contexts.append(phrases_dict[phrase])
-                scores.append(round(cfg.score_per_phrase / len(phrase), 2))
+        for phrase in sorted(phrases_dict, key=lambda p: (phrases_to_boost_values[p] <= 0, -phrases_to_boost_values[p])):
+            for transcript in phrases_dict[phrase]:
+                contexts.append(transcript)
+                scores.append(round(phrases_to_boost_values[phrase], 2))
                 phrases.append(phrase)
 
         context_graph = ContextGraph(context_score=cfg.context_score, depth_scaling=cfg.depth_scaling)
@@ -607,6 +655,7 @@ class GPUBoostingTreeModel(NGramGPULanguageModel):
             use_triton=cfg.use_triton,
             uniform_weights=cfg.uniform_weights,
         )
+
 
         # 5. save model
         if cfg.model_path is not None:

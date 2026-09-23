@@ -443,6 +443,22 @@ def normalize_timestamp_output(timestamps: dict):
     return timestamps
 
 
+def _hypothesis_token_ids(hyp: 'rnnt_utils.Hypothesis') -> List[int]:
+    """Return a hypothesis' raw decoded token-id sequence as a plain list of ints.
+
+    `y_sequence` may be a torch.Tensor, numpy array, or list; normalize to a
+    JSON-serializable list. Returns [] if the sequence is missing/empty.
+    """
+    seq = getattr(hyp, "y_sequence", None)
+    if seq is None:
+        return []
+    if isinstance(seq, torch.Tensor):
+        seq = seq.tolist()
+    elif hasattr(seq, "tolist"):  # numpy array
+        seq = seq.tolist()
+    return [int(t) for t in seq]
+
+
 def write_transcription(
     transcriptions: Union[List[rnnt_utils.Hypothesis], List[List[rnnt_utils.Hypothesis]], List[str]],
     cfg: DictConfig,
@@ -461,6 +477,12 @@ def write_transcription(
         pred_text_attr_name = 'pred_text_' + pred_by_model_name
     else:
         pred_text_attr_name = 'pred_text'
+
+    # Optionally emit each hypothesis' raw decoded token-id sequence into the
+    # output JSON. Only available on the Hypothesis path (List[str] has none).
+    save_token_ids = bool(cfg.get("save_token_ids", False)) if hasattr(cfg, "get") else getattr(
+        cfg, "save_token_ids", False
+    )
 
     return_hypotheses = True
     if isinstance(transcriptions[0], str):  # List[str]:
@@ -494,6 +516,9 @@ def write_transcription(
                 else:  # transcription is Hypothesis
                     item = {'audio_filepath': filepaths[idx], pred_text_attr_name: transcription.text}
 
+                    if save_token_ids:
+                        item['pred_token_ids'] = _hypothesis_token_ids(transcription)
+
                     if timestamps:
                         timestamps = transcription.timestamp
                         if timestamps is not None and isinstance(timestamps, dict):
@@ -521,6 +546,9 @@ def write_transcription(
                         item[pred_text_attr_name] = best_hyps[idx]
                     else:  # transcription is Hypothesis
                         item[pred_text_attr_name] = best_hyps[idx].text
+
+                        if save_token_ids:
+                            item['pred_token_ids'] = _hypothesis_token_ids(best_hyps[idx])
 
                         if timestamps:
                             timestamps = best_hyps[idx].timestamp

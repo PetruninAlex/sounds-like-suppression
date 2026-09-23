@@ -178,6 +178,12 @@ class ContextGraph:
                 node.output_score += 0 if output is None else output.output_score
                 queue.append(node)
 
+    def _token_score_at_depth(self, context_score: float, depth: int):
+        # Increase the score magnitude for tokens after the first one: more positive for
+        # boosts (context_score > 0), more negative for suppressions (context_score < 0).
+        sign = 1 if context_score > 0 else -1
+        return context_score * self.depth_scaling + sign * np.log(depth + 1)
+
     def build(
         self,
         token_ids: List[List[int]],
@@ -238,13 +244,19 @@ class ContextGraph:
             for i, token in enumerate(tokens):
                 if token not in node.next:
                     if i > 0 and not uniform_weights:
-                        token_score = context_score * self.depth_scaling + np.log(
-                            i + 1
-                        )  # depth scaling is used to give a larger score for all tokens after the first one
+                        token_score = self._token_score_at_depth(context_score, i)
                     else:
                         token_score = context_score
                     self.num_nodes += 1
                     is_end = i == len(tokens) - 1
+                    if token_score < 0 and node.node_score > 0:
+                        # Negative (suppression) token landing on a positive-boost prefix:
+                        # rebuild the cumulative as if scored from the root. Token 0 uses the
+                        # raw context_score (no depth scaling), tokens 1..i use the scaled score.
+                        prior_token_scores = [context_score] + [
+                            self._token_score_at_depth(context_score, j) for j in range(1, i + 1)
+                        ]
+                        token_score = sum(prior_token_scores) - node.node_score
                     node_score = node.node_score + token_score
                     node.next[token] = ContextState(
                         id=self.num_nodes,
@@ -259,14 +271,25 @@ class ContextGraph:
                     )
                 else:
                     # node exists, get the score of shared state.
-                    token_score = max(context_score, node.next[token].token_score)
+                    if context_score < 0 and node.next[token].token_score < 0:
+                        token_score = min(context_score, node.next[token].token_score)
+                    else:
+                        token_score = max(context_score, node.next[token].token_score)
                     node.next[token].token_score = token_score
                     node_score = node.node_score + token_score
                     node.next[token].node_score = node_score
-                    is_end = i == len(tokens) - 1 or node.next[token].is_end
+                    is_phrase_end = i == len(tokens) - 1
+                    # A suppression phrase (context_score < 0) that lands on a positive
+                    # prefix is neutralized by the max() above (token_score stays > 0).
+                    # Do not let it convert that shared node into a final state: doing so
+                    # zeroes the backoff penalty and turns the prefix of a real boosted
+                    # word into a "free exit", which lets greedy stop early on the prefix.
+                    if is_phrase_end and context_score < 0 and token_score > 0:
+                        is_phrase_end = False
+                    is_end = is_phrase_end or node.next[token].is_end
                     node.next[token].output_score = node_score if is_end else 0
                     node.next[token].is_end = is_end
-                    if i == len(tokens) - 1:
+                    if is_phrase_end:
                         node.next[token].phrase = phrase
                         node.next[token].ac_threshold = threshold
                 node = node.next[token]
